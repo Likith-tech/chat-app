@@ -7,7 +7,7 @@ function Login({ setUser }) {
 
   const handleLogin = async () => {
     try {
-      const res = await axios.post("http://localhost:5000/login", {
+      const res = await axios.post("https://chat-app-98qi.onrender.com/login", {
         email,
         password,
       });
