@@ -83,7 +83,7 @@ function Chat({ user }) {
 
     axios
       .get(
-        `http://localhost:5000/messages/${user.username}/${selectedUser.username}`
+        `https://chat-app-98qi.onrender.com/messages/${user.username}/${selectedUser.username}`
       )
       .then((res) => setMessages(res.data));
 
@@ -94,7 +94,7 @@ function Chat({ user }) {
   useEffect(() => {
 
     axios
-      .get(`http://localhost:5000/last-messages/${user.username}`)
+      .get(`https://chat-app-98qi.onrender.com/last-messages/${user.username}`)
       .then((res) => {
 
         const map = {};
@@ -121,7 +121,7 @@ function Chat({ user }) {
     if (search) {
 
       axios
-        .get(`http://localhost:5000/search/${search}`)
+        .get(`https://chat-app-98qi.onrender.com/search/${search}`)
         .then((res) => setSearchResults(res.data));
 
     } else {
@@ -135,7 +135,7 @@ function Chat({ user }) {
   useEffect(() => {
 
     axios
-      .get(`http://localhost:5000/contacts/${user.username}`)
+      .get(`https://chat-app-98qi.onrender.com/contacts/${user.username}`)
       .then((res) => setContacts(res.data));
 
   }, [user.username]);
@@ -164,7 +164,7 @@ function Chat({ user }) {
 
     socket.emit("sendMessage", msgData);
 
-    await axios.post("http://localhost:5000/message", msgData);
+    await axios.post("https://chat-app-98qi.onrender.com/message", msgData);
 
     setMessage("");
 
@@ -180,7 +180,7 @@ function Chat({ user }) {
     formData.append("file", file);
 
     const res = await axios.post(
-      "http://localhost:5000/upload",
+      "https://chat-app-98qi.onrender.com/upload",
       formData
     );
 
@@ -194,7 +194,7 @@ function Chat({ user }) {
 
     socket.emit("sendMessage", msgData);
 
-    await axios.post("http://localhost:5000/message", msgData);
+    await axios.post("https://chat-app-98qi.onrender.com/message", msgData);
 
   };
 
@@ -360,7 +360,7 @@ function Chat({ user }) {
                     msg.message.match(/\.(jpg|png|jpeg|gif)$/) ? (
 
                       <img
-                        src={`http://localhost:5000/${msg.message}`}
+                        src={`https://chat-app-98qi.onrender.com/${msg.message}`}
                         style={{
                           width: "150px",
                           borderRadius: "10px",
@@ -371,7 +371,7 @@ function Chat({ user }) {
                     ) : (
 
                       <a
-                        href={`http://localhost:5000/${msg.message}`}
+                        href={`https://chat-app-98qi.onrender.com/${msg.message}`}
                         target="_blank"
                         rel="noreferrer"
                       >
