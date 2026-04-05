@@ -4,24 +4,21 @@ import Register from "./Register";
 import Chat from "./Chat";
 
 function App() {
-  // ✅ Safe user loading (no JSON error)
   const [user, setUser] = useState(() => {
     try {
-      const storedUser = sessionStorage.getItem("user")
+      const storedUser = sessionStorage.getItem("user");
       return storedUser ? JSON.parse(storedUser) : null;
-    } catch (error) {
+    } catch {
       return null;
     }
   });
 
   const [showLogin, setShowLogin] = useState(true);
 
-  // 🔐 If NOT logged in
   if (!user) {
     return showLogin ? (
       <div style={{ textAlign: "center", marginTop: "50px" }}>
         <Login setUser={setUser} />
-
         <p>
           Don't have an account?{" "}
           <button onClick={() => setShowLogin(false)}>Register</button>
@@ -30,7 +27,6 @@ function App() {
     ) : (
       <div style={{ textAlign: "center", marginTop: "50px" }}>
         <Register switchToLogin={() => setShowLogin(true)} />
-
         <p>
           Already have an account?{" "}
           <button onClick={() => setShowLogin(true)}>Login</button>
@@ -39,7 +35,6 @@ function App() {
     );
   }
 
-  // 💬 If logged in → show chat
   return <Chat user={user} />;
 }
 
