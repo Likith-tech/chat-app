@@ -799,9 +799,13 @@ app.post(
 );
 
 app.post("/message", requireAuth, async (req, res) => {
-  const { sender, receiver, message } = req.body || {};
+  const sender =
+    String(req.body?.sender || req.body?.sender_id || "").trim();
+  const receiver =
+    String(req.body?.receiver || req.body?.receiver_id || "").trim();
+  const message = String(req.body?.message || "").trim();
 
-  if (!sender || !receiver || !message || !String(message).trim()) {
+  if (!sender || !receiver || !message) {
     return res.status(400).json({ message: "sender, receiver and message are required" });
   }
 
@@ -810,7 +814,7 @@ app.post("/message", requireAuth, async (req, res) => {
   try {
     const insertResult = await runQuery(
       "INSERT INTO messages (sender,receiver,message,status) VALUES (?,?,?,'sent')",
-      [sender, receiver, String(message).trim()]
+      [sender, receiver, message]
     );
 
     await runQuery(
@@ -829,8 +833,10 @@ app.post("/message", requireAuth, async (req, res) => {
     const messagePayload = {
       id: insertResult.insertId,
       sender,
+      sender_id: sender,
       receiver,
-      message: String(message).trim(),
+      receiver_id: receiver,
+      message,
       status: "sent",
       created_at: new Date(),
     };
@@ -853,11 +859,17 @@ app.get("/messages/:u1/:u2", requireAuth, async (req, res) => {
       `SELECT * FROM messages
        WHERE (sender=? AND receiver=?)
        OR (sender=? AND receiver=?)
-       ORDER BY created_at`,
+       ORDER BY created_at ASC`,
       [u1, u2, u2, u1]
     );
 
-    res.json(result);
+    res.json(
+      result.map((row) => ({
+        ...row,
+        sender_id: row.sender,
+        receiver_id: row.receiver,
+      }))
+    );
   } catch {
     res.status(500).json({ message: "Failed to load messages" });
   }

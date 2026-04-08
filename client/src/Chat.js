@@ -84,6 +84,7 @@ function Chat({ user, onLogout, onUserUpdate }) {
   };
 
   const compactModeClass = profileData.compactMode ? "compact" : "";
+  const selectedChatUsername = selectedUser?.username || selectedUser?.contact || null;
 
   useEffect(() => {
     activeCallRef.current = activeCall;
@@ -230,13 +231,13 @@ function Chat({ user, onLogout, onUserUpdate }) {
     const handleOnlineUsers = (users) => setOnlineUsers(users);
 
     const handleTyping = (payload) => {
-      if (payload?.from === selectedUser?.username) {
+      if (payload?.from === selectedChatUsername) {
         setTypingUser(payload.from);
       }
     };
 
     const handleStopTyping = (payload) => {
-      if (!payload?.from || payload.from === selectedUser?.username) {
+      if (!payload?.from || payload.from === selectedChatUsername) {
         setTypingUser("");
       }
     };
@@ -255,11 +256,11 @@ function Chat({ user, onLogout, onUserUpdate }) {
         return alreadyExists ? prev : [...prev, { contact: otherUser, displayName: otherUser }];
       });
 
-      if (!selectedUser) return;
+      if (!selectedChatUsername) return;
 
       const isRelevant =
-        (data.sender === user.username && data.receiver === selectedUser.username) ||
-        (data.sender === selectedUser.username && data.receiver === user.username);
+        (data.sender === user.username && data.receiver === selectedChatUsername) ||
+        (data.sender === selectedChatUsername && data.receiver === user.username);
 
       if (isRelevant) {
         setMessages((prev) => [...prev, data]);
@@ -385,10 +386,18 @@ function Chat({ user, onLogout, onUserUpdate }) {
       socket.off("webrtc:answer", handleAnswer);
       socket.off("webrtc:ice-candidate", handleIceCandidate);
     };
-  }, [cleanupCall, createPeerConnection, ensureLocalMedia, loadCallHistory, selectedUser, user.username, localStream]);
+  }, [
+    cleanupCall,
+    createPeerConnection,
+    ensureLocalMedia,
+    loadCallHistory,
+    selectedChatUsername,
+    user.username,
+    localStream,
+  ]);
 
   useEffect(() => {
-    if (!selectedUser) {
+    if (!selectedChatUsername) {
       setMessages([]);
       return;
     }
@@ -397,15 +406,16 @@ function Chat({ user, onLogout, onUserUpdate }) {
 
     const loadMessages = () =>
       api
-        .get(`/messages/${user.username}/${selectedUser.username}`)
+        .get(`/messages/${user.username}/${selectedChatUsername}`)
         .then((res) => setMessages(res.data))
+        .catch(() => setMessages([]))
         .finally(() => setLoadingMessages(false));
 
     loadMessages();
 
     const interval = setInterval(loadMessages, 4000);
     return () => clearInterval(interval);
-  }, [selectedUser, user.username]);
+  }, [selectedChatUsername, user.username]);
 
   useEffect(() => {
     api.get(`/last-messages/${user.username}`).then((res) => {
@@ -460,11 +470,11 @@ function Chat({ user, onLogout, onUserUpdate }) {
   }, [activeTab, loadCallHistory, user.username]);
 
   const sendMessage = async () => {
-    if (!message.trim() || !selectedUser) return;
+    if (!message.trim() || !selectedChatUsername) return;
 
     const msgData = {
       sender: user.username,
-      receiver: selectedUser.username,
+      receiver: selectedChatUsername,
       message: message.trim(),
     };
 
@@ -476,7 +486,7 @@ function Chat({ user, onLogout, onUserUpdate }) {
   const handleFile = async (e) => {
     const file = e.target.files?.[0];
 
-    if (!file || !selectedUser) return;
+    if (!file || !selectedChatUsername) return;
 
     const formData = new FormData();
     formData.append("file", file);
@@ -487,11 +497,9 @@ function Chat({ user, onLogout, onUserUpdate }) {
 
     const msgData = {
       sender: user.username,
-      receiver: selectedUser.username,
+      receiver: selectedChatUsername,
       message: fileUrl,
     };
-
-    socket.emit("sendMessage", msgData);
     await api.post(`/message`, msgData);
   };
 
@@ -594,18 +602,18 @@ function Chat({ user, onLogout, onUserUpdate }) {
   };
 
   const startOutgoingCall = async (callType) => {
-    if (!selectedUser) return;
+    if (!selectedChatUsername) return;
 
     try {
       setCallError("");
-      const roomId = `${user.username}-${selectedUser.username}-${Date.now()}`;
+      const roomId = `${user.username}-${selectedChatUsername}-${Date.now()}`;
 
       const stream = await ensureLocalMedia(callType);
-      const pc = createPeerConnection(selectedUser.username, roomId, stream);
+      const pc = createPeerConnection(selectedChatUsername, roomId, stream);
 
       setActiveCall({
         roomId,
-        peerUsername: selectedUser.username,
+        peerUsername: selectedChatUsername,
         callType,
         direction: "outgoing",
         status: "calling",
@@ -613,7 +621,7 @@ function Chat({ user, onLogout, onUserUpdate }) {
 
       socket.emit("call:initiate", {
         from: user.username,
-        to: selectedUser.username,
+        to: selectedChatUsername,
         roomId,
         callType,
       });
@@ -622,7 +630,7 @@ function Chat({ user, onLogout, onUserUpdate }) {
       await pc.setLocalDescription(offer);
 
       socket.emit("webrtc:offer", {
-        to: selectedUser.username,
+        to: selectedChatUsername,
         from: user.username,
         roomId,
         callType,
@@ -827,10 +835,10 @@ function Chat({ user, onLogout, onUserUpdate }) {
       <>
         <header className="chat-header">
           <div>
-            <h2>{selectedUser?.displayName || selectedUser?.username || "Select a chat"}</h2>
+            <h2>{selectedUser?.displayName || selectedChatUsername || "Select a chat"}</h2>
             <p>
-              {selectedUser
-                ? isOnline(selectedUser.username)
+              {selectedChatUsername
+                ? isOnline(selectedChatUsername)
                   ? "Online"
                   : "Offline"
                 : "Choose a contact or search users"}
@@ -841,14 +849,14 @@ function Chat({ user, onLogout, onUserUpdate }) {
             <button
               className="ghost-btn"
               onClick={() => startOutgoingCall("voice")}
-              disabled={!selectedUser}
+              disabled={!selectedChatUsername}
             >
               Voice Call
             </button>
             <button
               className="ghost-btn"
               onClick={() => startOutgoingCall("video")}
-              disabled={!selectedUser}
+              disabled={!selectedChatUsername}
             >
               Video Call
             </button>
@@ -861,7 +869,7 @@ function Chat({ user, onLogout, onUserUpdate }) {
         <section className="messages" ref={chatRef}>
           {loadingMessages && <p className="info-line">Loading messages...</p>}
 
-          {!loadingMessages && !selectedUser && (
+          {!loadingMessages && !selectedChatUsername && (
             <p className="info-line">Open any conversation to start chatting.</p>
           )}
 
@@ -891,7 +899,7 @@ function Chat({ user, onLogout, onUserUpdate }) {
           })}
         </section>
 
-        {typingUser && selectedUser?.username === typingUser && (
+        {typingUser && selectedChatUsername === typingUser && (
           <div className="typing-line">{typingUser} is typing...</div>
         )}
 
@@ -900,10 +908,10 @@ function Chat({ user, onLogout, onUserUpdate }) {
             value={message}
             onChange={(e) => {
               setMessage(e.target.value);
-              if (selectedUser?.username) {
-                socket.emit("typing", { to: selectedUser.username });
+              if (selectedChatUsername) {
+                socket.emit("typing", { to: selectedChatUsername });
                 setTimeout(
-                  () => socket.emit("stopTyping", { to: selectedUser.username }),
+                  () => socket.emit("stopTyping", { to: selectedChatUsername }),
                   900
                 );
               }
@@ -911,16 +919,16 @@ function Chat({ user, onLogout, onUserUpdate }) {
             onKeyDown={(e) => {
               if (e.key === "Enter") sendMessage();
             }}
-            placeholder={selectedUser ? "Type a message" : "Select a chat to send messages"}
-            disabled={!selectedUser}
+            placeholder={selectedChatUsername ? "Type a message" : "Select a chat to send messages"}
+            disabled={!selectedChatUsername}
           />
 
-          <label className={`upload-btn ${!selectedUser ? "disabled" : ""}`}>
+          <label className={`upload-btn ${!selectedChatUsername ? "disabled" : ""}`}>
             Attach
-            <input type="file" onChange={handleFile} disabled={!selectedUser} />
+            <input type="file" onChange={handleFile} disabled={!selectedChatUsername} />
           </label>
 
-          <button className="send-btn" onClick={sendMessage} disabled={!selectedUser}>
+          <button className="send-btn" onClick={sendMessage} disabled={!selectedChatUsername}>
             Send
           </button>
         </footer>
