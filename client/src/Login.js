@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import axios from "axios";
+import { api } from "./api";
 
 function Login({ setUser, switchToRegister }) {
   const [email, setEmail] = useState("");
@@ -17,10 +17,14 @@ function Login({ setUser, switchToRegister }) {
     setError("");
 
     try {
-      const res = await axios.post("https://chat-app-98qi.onrender.com/login", {
+      const res = await api.post("/login", {
         email,
         password,
       });
+
+      if (!res.data?.user || !res.data?.token) {
+        throw new Error("Invalid login response");
+      }
 
       if (res.data.token) {
         localStorage.setItem("token", res.data.token);
@@ -29,7 +33,7 @@ function Login({ setUser, switchToRegister }) {
 
       setUser(res.data.user);
     } catch (err) {
-      setError(err?.response?.data || "Login failed. Try again.");
+      setError(err?.response?.data?.message || "Login failed. Try again.");
     } finally {
       setLoading(false);
     }

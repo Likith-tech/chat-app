@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import axios from "axios";
+import { api } from "./api";
 
 function Register({ switchToLogin, setUser }) {
   const [username, setUsername] = useState("");
@@ -18,19 +18,20 @@ function Register({ switchToLogin, setUser }) {
     setError("");
 
     try {
-      await axios.post("https://chat-app-98qi.onrender.com/register", {
+      await api.post("/register", {
         username,
         email,
         password,
       });
 
-      const loginRes = await axios.post(
-        "https://chat-app-98qi.onrender.com/login",
-        {
-          email,
-          password,
-        }
-      );
+      const loginRes = await api.post("/login", {
+        email,
+        password,
+      });
+
+      if (!loginRes.data?.user || !loginRes.data?.token) {
+        throw new Error("Auto login failed");
+      }
 
       if (loginRes.data.token) {
         localStorage.setItem("token", loginRes.data.token);
@@ -39,7 +40,7 @@ function Register({ switchToLogin, setUser }) {
       sessionStorage.setItem("user", JSON.stringify(loginRes.data.user));
       setUser(loginRes.data.user);
     } catch (err) {
-      setError(err?.response?.data || "Registration failed. Try again.");
+      setError(err?.response?.data?.message || "Registration failed. Try again.");
     } finally {
       setLoading(false);
     }

@@ -1,11 +1,13 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import io from "socket.io-client";
-import axios from "axios";
 import ProfilePage from "./ProfilePage";
+import { api, API_BASE } from "./api";
 import "./Chat.css";
 
-const API_BASE = "https://chat-app-98qi.onrender.com";
-const socket = io(API_BASE);
+const socket = io(API_BASE, {
+  autoConnect: false,
+  transports: ["websocket", "polling"],
+});
 
 const TABS = [
   { id: "chats", label: "Chats" },
@@ -102,7 +104,7 @@ function Chat({ user, onLogout, onUserUpdate }) {
   useEffect(() => {
     const hydrateProfile = async () => {
       try {
-        const res = await axios.get(`${API_BASE}/profile/${user.username}`);
+        const res = await api.get(`/profile/${user.username}`);
         const merged = {
           ...defaultProfile,
           ...res.data,
@@ -122,7 +124,15 @@ function Chat({ user, onLogout, onUserUpdate }) {
   }, [onUserUpdate, user, user.username]);
 
   useEffect(() => {
-    socket.emit("join", { username: user.username });
+    socket.auth = { token: localStorage.getItem("token") };
+
+    if (!socket.connected) {
+      socket.connect();
+    }
+
+    return () => {
+      socket.disconnect();
+    };
   }, [user.username]);
 
   const cleanupCall = useCallback((options = {}) => {
@@ -207,7 +217,7 @@ function Chat({ user, onLogout, onUserUpdate }) {
   const loadCallHistory = useCallback(async () => {
     setCallsLoading(true);
     try {
-      const res = await axios.get(`${API_BASE}/calls/${user.username}`);
+      const res = await api.get(`/calls/${user.username}`);
       setCallHistory(res.data);
     } catch {
       setCallHistory([]);
@@ -219,13 +229,17 @@ function Chat({ user, onLogout, onUserUpdate }) {
   useEffect(() => {
     const handleOnlineUsers = (users) => setOnlineUsers(users);
 
-    const handleTyping = (username) => {
-      if (username === selectedUser?.username) {
-        setTypingUser(username);
+    const handleTyping = (payload) => {
+      if (payload?.from === selectedUser?.username) {
+        setTypingUser(payload.from);
       }
     };
 
-    const handleStopTyping = () => setTypingUser("");
+    const handleStopTyping = (payload) => {
+      if (!payload?.from || payload.from === selectedUser?.username) {
+        setTypingUser("");
+      }
+    };
 
     const handleReceiveMessage = (data) => {
       const otherUser =
@@ -381,14 +395,20 @@ function Chat({ user, onLogout, onUserUpdate }) {
 
     setLoadingMessages(true);
 
-    axios
-      .get(`${API_BASE}/messages/${user.username}/${selectedUser.username}`)
-      .then((res) => setMessages(res.data))
-      .finally(() => setLoadingMessages(false));
+    const loadMessages = () =>
+      api
+        .get(`/messages/${user.username}/${selectedUser.username}`)
+        .then((res) => setMessages(res.data))
+        .finally(() => setLoadingMessages(false));
+
+    loadMessages();
+
+    const interval = setInterval(loadMessages, 4000);
+    return () => clearInterval(interval);
   }, [selectedUser, user.username]);
 
   useEffect(() => {
-    axios.get(`${API_BASE}/last-messages/${user.username}`).then((res) => {
+    api.get(`/last-messages/${user.username}`).then((res) => {
       const map = {};
 
       res.data.forEach((msg) => {
@@ -407,16 +427,14 @@ function Chat({ user, onLogout, onUserUpdate }) {
     }
 
     const timer = setTimeout(() => {
-      axios
-        .get(`${API_BASE}/search/${search.trim()}`)
-        .then((res) => setSearchResults(res.data));
+      api.get(`/search/${search.trim()}`).then((res) => setSearchResults(res.data));
     }, 250);
 
     return () => clearTimeout(timer);
   }, [search]);
 
   useEffect(() => {
-    axios.get(`${API_BASE}/contacts/${user.username}`).then((res) => {
+    api.get(`/contacts/${user.username}`).then((res) => {
       setContacts(res.data);
     });
   }, [user.username]);
@@ -430,8 +448,8 @@ function Chat({ user, onLogout, onUserUpdate }) {
   useEffect(() => {
     if (activeTab === "status") {
       setStatusLoading(true);
-      axios
-        .get(`${API_BASE}/statuses-feed/${user.username}`)
+      api
+        .get(`/statuses-feed/${user.username}`)
         .then((res) => setStatusFeed(res.data))
         .finally(() => setStatusLoading(false));
     }
@@ -450,8 +468,7 @@ function Chat({ user, onLogout, onUserUpdate }) {
       message: message.trim(),
     };
 
-    socket.emit("sendMessage", msgData);
-    await axios.post(`${API_BASE}/message`, msgData);
+    await api.post(`/message`, msgData);
 
     setMessage("");
   };
@@ -464,7 +481,7 @@ function Chat({ user, onLogout, onUserUpdate }) {
     const formData = new FormData();
     formData.append("file", file);
 
-    const res = await axios.post(`${API_BASE}/upload`, formData);
+    const res = await api.post(`/upload`, formData);
 
     const fileUrl = `uploads/${res.data.file}`;
 
@@ -475,7 +492,7 @@ function Chat({ user, onLogout, onUserUpdate }) {
     };
 
     socket.emit("sendMessage", msgData);
-    await axios.post(`${API_BASE}/message`, msgData);
+    await api.post(`/message`, msgData);
   };
 
   const isOnline = (username) => {
@@ -515,7 +532,7 @@ function Chat({ user, onLogout, onUserUpdate }) {
       profilePic: profileData.profilePic,
     };
 
-    const res = await axios.put(`${API_BASE}/profile/${user.username}`, payload);
+    const res = await api.put(`/profile/${user.username}`, payload);
     const merged = { ...defaultProfile, ...res.data };
 
     setProfileData(merged);
@@ -527,7 +544,7 @@ function Chat({ user, onLogout, onUserUpdate }) {
     const formData = new FormData();
     formData.append("photo", file);
 
-    const res = await axios.post(`${API_BASE}/profile/${user.username}/photo`, formData);
+    const res = await api.post(`/profile/${user.username}/photo`, formData);
     const merged = { ...defaultProfile, ...res.data };
 
     setProfileData(merged);
@@ -565,11 +582,11 @@ function Chat({ user, onLogout, onUserUpdate }) {
     }
 
     try {
-      await axios.post(`${API_BASE}/statuses`, formData);
+      await api.post(`/statuses`, formData);
       setStatusText("");
       setStatusFile(null);
 
-      const feed = await axios.get(`${API_BASE}/statuses-feed/${user.username}`);
+      const feed = await api.get(`/statuses-feed/${user.username}`);
       setStatusFeed(feed.data);
     } finally {
       setStatusPosting(false);
@@ -789,7 +806,7 @@ function Chat({ user, onLogout, onUserUpdate }) {
               <div>
                 <strong>{withUser}</strong>
                 <p>
-                  {renderCallBadge(entry)} • {entry.status}
+                  {renderCallBadge(entry)} â€¢ {entry.status}
                 </p>
               </div>
               <div className="call-meta">
@@ -883,8 +900,13 @@ function Chat({ user, onLogout, onUserUpdate }) {
             value={message}
             onChange={(e) => {
               setMessage(e.target.value);
-              socket.emit("typing", user.username);
-              setTimeout(() => socket.emit("stopTyping"), 900);
+              if (selectedUser?.username) {
+                socket.emit("typing", { to: selectedUser.username });
+                setTimeout(
+                  () => socket.emit("stopTyping", { to: selectedUser.username }),
+                  900
+                );
+              }
             }}
             onKeyDown={(e) => {
               if (e.key === "Enter") sendMessage();
@@ -1065,6 +1087,7 @@ function Chat({ user, onLogout, onUserUpdate }) {
 }
 
 export default Chat;
+
 
 
 

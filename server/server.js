@@ -5,13 +5,42 @@ const http = require("http");
 const cors = require("cors");
 const { Server } = require("socket.io");
 const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
 
+const PORT = Number(process.env.PORT || 5000);
+const JWT_SECRET = process.env.JWT_SECRET || "dev_secret_change_me";
+const DB_NAME = process.env.DB_NAME;
+
 const app = express();
-app.use(cors());
 app.use(express.json());
+
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || process.env.CLIENT_ORIGIN || "")
+  .split(",")
+  .map((item) => item.trim())
+  .filter(Boolean);
+
+const isAllowedOrigin = (origin) => {
+  if (!origin) return true;
+  if (allowedOrigins.length === 0) return true;
+  if (allowedOrigins.includes("*")) return true;
+  return allowedOrigins.includes(origin);
+};
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (isAllowedOrigin(origin)) {
+        callback(null, true);
+        return;
+      }
+
+      callback(new Error(`CORS blocked for origin: ${origin}`));
+    },
+  })
+);
 
 const uploadsDir = path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadsDir)) {
@@ -21,7 +50,16 @@ if (!fs.existsSync(uploadsDir)) {
 const server = http.createServer(app);
 
 const io = new Server(server, {
-  cors: { origin: "*" },
+  cors: {
+    origin(origin, callback) {
+      if (isAllowedOrigin(origin)) {
+        callback(null, true);
+        return;
+      }
+
+      callback(new Error(`Socket CORS blocked for origin: ${origin}`));
+    },
+  },
 });
 
 const onlineUsers = new Map();
@@ -35,10 +73,77 @@ const runQuery = (query, params = []) =>
     });
   });
 
+const getTokenFromHeader = (headerValue = "") => {
+  if (!headerValue.startsWith("Bearer ")) return null;
+  return headerValue.slice("Bearer ".length).trim();
+};
+
+const signToken = (payload) =>
+  jwt.sign(payload, JWT_SECRET, {
+    expiresIn: "7d",
+  });
+
+const requireAuth = (req, res, next) => {
+  const token = getTokenFromHeader(req.headers.authorization || "");
+
+  if (!token) {
+    return res.status(401).json({ message: "Missing auth token" });
+  }
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    return next();
+  } catch {
+    return res.status(401).json({ message: "Invalid or expired token" });
+  }
+};
+
+const requireSameUser = (req, res, usernameToMatch) => {
+  if (req.user?.username !== usernameToMatch) {
+    res.status(403).json({ message: "Forbidden" });
+    return false;
+  }
+
+  return true;
+};
+
+const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const passwordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z\d]).{8,}$/;
+
+const addSocketForUser = (username, socketId) => {
+  if (!onlineUsers.has(username)) {
+    onlineUsers.set(username, new Set());
+  }
+
+  onlineUsers.get(username).add(socketId);
+};
+
+const removeSocketForUser = (username, socketId) => {
+  const set = onlineUsers.get(username);
+  if (!set) return;
+
+  set.delete(socketId);
+
+  if (set.size === 0) {
+    onlineUsers.delete(username);
+  }
+};
+
+const getSocketIds = (username) => {
+  const set = onlineUsers.get(username);
+  return set ? Array.from(set) : [];
+};
+
+const emitToUser = (username, eventName, payload) => {
+  const ids = getSocketIds(username);
+  ids.forEach((id) => io.to(id).emit(eventName, payload));
+};
+
 const emitOnlineUsers = () => {
-  const users = Array.from(onlineUsers.entries()).map(([username, id]) => ({
-    id,
+  const users = Array.from(onlineUsers.entries()).map(([username, ids]) => ({
     username,
+    sockets: ids.size,
   }));
 
   io.emit("onlineUsers", users);
@@ -59,8 +164,33 @@ const uploadStatusMedia = multer({ storage: createStorage("status") });
 
 app.use("/uploads", express.static(uploadsDir));
 
+const ensureUniqueIndex = async (tableName, indexName, columnName) => {
+  if (!DB_NAME) return;
+
+  const rows = await runQuery(
+    `
+      SELECT 1
+      FROM information_schema.statistics
+      WHERE table_schema = ?
+        AND table_name = ?
+        AND index_name = ?
+      LIMIT 1
+    `,
+    [DB_NAME, tableName, indexName]
+  );
+
+  if (rows.length === 0) {
+    await runQuery(
+      `CREATE UNIQUE INDEX ${indexName} ON ${tableName}(${columnName})`
+    );
+  }
+};
+
 const ensureSchema = async () => {
   try {
+    await ensureUniqueIndex("users", "uniq_users_username", "username");
+    await ensureUniqueIndex("users", "uniq_users_email", "email");
+
     await runQuery(`
       CREATE TABLE IF NOT EXISTS user_profiles (
         username VARCHAR(255) PRIMARY KEY,
@@ -235,39 +365,46 @@ const saveCallLog = async ({
   );
 };
 
+io.use((socket, next) => {
+  const authToken = socket.handshake.auth?.token;
+  const headerToken = getTokenFromHeader(socket.handshake.headers.authorization || "");
+  const token = authToken || headerToken;
+
+  if (!token) {
+    next(new Error("Unauthorized socket"));
+    return;
+  }
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    socket.user = decoded;
+    next();
+  } catch {
+    next(new Error("Invalid socket token"));
+  }
+});
+
 io.on("connection", (socket) => {
-  socket.on("join", (userData) => {
-    if (!userData?.username) return;
+  const socketUsername = socket.user?.username;
 
-    onlineUsers.set(userData.username, socket.id);
+  if (socketUsername) {
+    addSocketForUser(socketUsername, socket.id);
     emitOnlineUsers();
+  }
+
+  socket.on("typing", ({ to }) => {
+    if (!socketUsername || !to) return;
+    emitToUser(to, "typing", { from: socketUsername });
   });
 
-  socket.on("typing", (username) => {
-    socket.broadcast.emit("typing", username);
-  });
-
-  socket.on("stopTyping", () => {
-    socket.broadcast.emit("stopTyping");
-  });
-
-  socket.on("sendMessage", (data) => {
-    const messageWithTime = {
-      ...data,
-      created_at: new Date(),
-      status: "sent",
-    };
-
-    const receiverSocketId = onlineUsers.get(data.receiver);
-
-    if (receiverSocketId) {
-      io.to(receiverSocketId).emit("receiveMessage", messageWithTime);
-    }
-
-    socket.emit("receiveMessage", messageWithTime);
+  socket.on("stopTyping", ({ to }) => {
+    if (!socketUsername || !to) return;
+    emitToUser(to, "stopTyping", { from: socketUsername });
   });
 
   socket.on("messageSeen", ({ sender, receiver }) => {
+    if (!socketUsername || socketUsername !== receiver) return;
+
     const query = `
       UPDATE messages
       SET status='seen'
@@ -278,7 +415,9 @@ io.on("connection", (socket) => {
   });
 
   socket.on("call:initiate", async (payload) => {
-    const { from, to, callType, roomId } = payload || {};
+    const { to, callType, roomId } = payload || {};
+    const from = socketUsername;
+
     if (!from || !to || !roomId) return;
 
     activeCalls.set(roomId, {
@@ -290,10 +429,10 @@ io.on("connection", (socket) => {
       acceptedAt: null,
     });
 
-    const receiverSocketId = onlineUsers.get(to);
+    const receiverSockets = getSocketIds(to);
 
-    if (!receiverSocketId) {
-      socket.emit("call:unavailable", {
+    if (receiverSockets.length === 0) {
+      emitToUser(from, "call:unavailable", {
         roomId,
         reason: "offline",
       });
@@ -319,7 +458,7 @@ io.on("connection", (socket) => {
       return;
     }
 
-    io.to(receiverSocketId).emit("call:incoming", {
+    emitToUser(to, "call:incoming", {
       from,
       to,
       roomId,
@@ -328,7 +467,9 @@ io.on("connection", (socket) => {
   });
 
   socket.on("call:accept", (payload) => {
-    const { from, to, roomId } = payload || {};
+    const { to, roomId } = payload || {};
+    const from = socketUsername;
+
     if (!from || !to || !roomId) return;
 
     const session = activeCalls.get(roomId);
@@ -337,20 +478,26 @@ io.on("connection", (socket) => {
       activeCalls.set(roomId, session);
     }
 
-    const callerSocketId = onlineUsers.get(to);
-    if (callerSocketId) {
-      io.to(callerSocketId).emit("call:accepted", payload);
-    }
+    emitToUser(to, "call:accepted", {
+      from,
+      to,
+      roomId,
+      callType: payload?.callType || "voice",
+    });
   });
 
   socket.on("call:reject", async (payload) => {
-    const { from, to, roomId } = payload || {};
+    const { to, roomId } = payload || {};
+    const from = socketUsername;
+
     if (!from || !to || !roomId) return;
 
-    const callerSocketId = onlineUsers.get(to);
-    if (callerSocketId) {
-      io.to(callerSocketId).emit("call:rejected", payload);
-    }
+    emitToUser(to, "call:rejected", {
+      from,
+      to,
+      roomId,
+      callType: payload?.callType || "voice",
+    });
 
     const session = activeCalls.get(roomId);
     if (session) {
@@ -374,13 +521,18 @@ io.on("connection", (socket) => {
   });
 
   socket.on("call:end", async (payload) => {
-    const { from, to, roomId, durationSec, status } = payload || {};
+    const { to, roomId, durationSec, status } = payload || {};
+    const from = socketUsername;
+
     if (!from || !to || !roomId) return;
 
-    const peerSocketId = onlineUsers.get(to);
-    if (peerSocketId) {
-      io.to(peerSocketId).emit("call:ended", payload);
-    }
+    emitToUser(to, "call:ended", {
+      from,
+      to,
+      roomId,
+      durationSec: durationSec || 0,
+      status: status || "completed",
+    });
 
     const session = activeCalls.get(roomId);
     if (session) {
@@ -404,51 +556,38 @@ io.on("connection", (socket) => {
   });
 
   socket.on("webrtc:offer", ({ to, ...rest }) => {
-    const receiverSocketId = onlineUsers.get(to);
-    if (receiverSocketId) {
-      io.to(receiverSocketId).emit("webrtc:offer", rest);
-    }
+    if (!socketUsername || !to) return;
+    emitToUser(to, "webrtc:offer", { ...rest, from: socketUsername });
   });
 
   socket.on("webrtc:answer", ({ to, ...rest }) => {
-    const receiverSocketId = onlineUsers.get(to);
-    if (receiverSocketId) {
-      io.to(receiverSocketId).emit("webrtc:answer", rest);
-    }
+    if (!socketUsername || !to) return;
+    emitToUser(to, "webrtc:answer", { ...rest, from: socketUsername });
   });
 
   socket.on("webrtc:ice-candidate", ({ to, ...rest }) => {
-    const receiverSocketId = onlineUsers.get(to);
-    if (receiverSocketId) {
-      io.to(receiverSocketId).emit("webrtc:ice-candidate", rest);
-    }
+    if (!socketUsername || !to) return;
+    emitToUser(to, "webrtc:ice-candidate", { ...rest, from: socketUsername });
   });
 
   socket.on("disconnect", async () => {
-    const disconnectedUser = Array.from(onlineUsers.entries()).find(
-      ([, id]) => id === socket.id
-    );
-
-    if (disconnectedUser) {
-      const [username] = disconnectedUser;
-      onlineUsers.delete(username);
+    if (socketUsername) {
+      removeSocketForUser(socketUsername, socket.id);
 
       const sessions = Array.from(activeCalls.values()).filter(
-        (call) => call.caller === username || call.receiver === username
+        (call) => call.caller === socketUsername || call.receiver === socketUsername
       );
 
       for (const session of sessions) {
         activeCalls.delete(session.roomId);
 
-        const peer = session.caller === username ? session.receiver : session.caller;
-        const peerSocketId = onlineUsers.get(peer);
+        const peer =
+          session.caller === socketUsername ? session.receiver : session.caller;
 
-        if (peerSocketId) {
-          io.to(peerSocketId).emit("call:ended", {
-            roomId: session.roomId,
-            reason: "disconnected",
-          });
-        }
+        emitToUser(peer, "call:ended", {
+          roomId: session.roomId,
+          reason: "disconnected",
+        });
 
         try {
           await saveCallLog({
@@ -471,56 +610,100 @@ io.on("connection", (socket) => {
   });
 });
 
-app.post("/register", async (req, res) => {
-  const { username, email, password } = req.body;
-
-  if (!username || !email || !password) {
-    return res.status(400).send("Username, email and password are required");
-  }
-
-  const hashed = await bcrypt.hash(password, 10);
-
-  db.query(
-    "INSERT INTO users (username,email,password) VALUES (?,?,?)",
-    [username, email, hashed],
-    async (err) => {
-      if (err) return res.status(500).send(err.sqlMessage || "Registration failed");
-
-      try {
-        await upsertUserProfile(username, { displayName: username });
-      } catch (profileErr) {
-        console.error("Profile seed failed:", profileErr.message);
-      }
-
-      res.send("Registered");
-    }
-  );
+app.get("/health", (req, res) => {
+  res.json({ ok: true, service: "chat-backend" });
 });
 
-app.post("/login", (req, res) => {
-  const { email, password } = req.body;
+app.post("/register", async (req, res) => {
+  const username = String(req.body?.username || "").trim();
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  const password = String(req.body?.password || "");
 
-  db.query("SELECT * FROM users WHERE email=?", [email], async (err, result) => {
-    if (err) return res.status(500).send("Server error");
+  if (!username || !email || !password) {
+    return res.status(400).json({ message: "Username, email and password are required" });
+  }
+
+  if (!emailRegex.test(email)) {
+    return res.status(400).json({ message: "Invalid email format" });
+  }
+
+  if (!passwordRegex.test(password)) {
+    return res.status(400).json({
+      message:
+        "Password must be at least 8 chars and include uppercase, lowercase, number and special character",
+    });
+  }
+
+  try {
+    const duplicateRows = await runQuery(
+      `
+      SELECT username, email
+      FROM users
+      WHERE username = ? OR email = ?
+      LIMIT 1
+      `,
+      [username, email]
+    );
+
+    if (duplicateRows.length) {
+      const duplicate = duplicateRows[0];
+      if (duplicate.username === username) {
+        return res.status(409).json({ message: "Username already exists" });
+      }
+      if (duplicate.email === email) {
+        return res.status(409).json({ message: "Email already exists" });
+      }
+    }
+
+    const hashed = await bcrypt.hash(password, 10);
+
+    await runQuery("INSERT INTO users (username,email,password) VALUES (?,?,?)", [
+      username,
+      email,
+      hashed,
+    ]);
+
+    await upsertUserProfile(username, { displayName: username });
+
+    return res.status(201).json({ message: "Registered" });
+  } catch (err) {
+    if (err?.errno === 1062) {
+      return res.status(409).json({ message: "Username or email already exists" });
+    }
+    return res.status(500).json({ message: "Registration failed" });
+  }
+});
+
+app.post("/login", async (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  const password = String(req.body?.password || "");
+
+  if (!email || !password) {
+    return res.status(400).json({ message: "Email and password are required" });
+  }
+
+  try {
+    const result = await runQuery("SELECT * FROM users WHERE email=? LIMIT 1", [email]);
 
     if (!result || result.length === 0) {
-      return res.status(404).send("User not found");
+      return res.status(401).json({ message: "Invalid credentials" });
     }
 
     const user = result[0];
     const match = await bcrypt.compare(password, user.password);
 
-    if (!match) return res.status(401).send("Wrong password");
-
-    let profile = null;
-
-    try {
-      profile = await getUserProfile(user.username);
-    } catch (profileErr) {
-      console.error("Profile load failed:", profileErr.message);
+    if (!match) {
+      return res.status(401).json({ message: "Invalid credentials" });
     }
 
-    res.json({
+    const profile = await getUserProfile(user.username);
+    const token = signToken({
+      username: user.username,
+      email: user.email,
+    });
+
+    return res.json({
+      token,
       user: {
         username: user.username,
         email: user.email,
@@ -535,23 +718,29 @@ app.post("/login", (req, res) => {
         statusPrivacy: profile?.statusPrivacy || "contacts",
       },
     });
-  });
-});
-
-app.get("/profile/:username", async (req, res) => {
-  try {
-    const profile = await getUserProfile(req.params.username);
-
-    if (!profile) return res.status(404).send("User not found");
-
-    res.json(profile);
-  } catch (error) {
-    res.status(500).send("Failed to load profile");
+  } catch {
+    return res.status(500).json({ message: "Server error" });
   }
 });
 
-app.put("/profile/:username", async (req, res) => {
+app.get("/profile/:username", requireAuth, async (req, res) => {
+  if (!requireSameUser(req, res, req.params.username)) return;
+
+  try {
+    const profile = await getUserProfile(req.params.username);
+
+    if (!profile) return res.status(404).json({ message: "User not found" });
+
+    res.json(profile);
+  } catch {
+    res.status(500).json({ message: "Failed to load profile" });
+  }
+});
+
+app.put("/profile/:username", requireAuth, async (req, res) => {
   const username = req.params.username;
+  if (!requireSameUser(req, res, username)) return;
+
   const body = req.body || {};
 
   try {
@@ -569,18 +758,20 @@ app.put("/profile/:username", async (req, res) => {
 
     const profile = await getUserProfile(username);
     res.json(profile);
-  } catch (error) {
-    res.status(500).send("Failed to update profile");
+  } catch {
+    res.status(500).json({ message: "Failed to update profile" });
   }
 });
 
 app.post(
   "/profile/:username/photo",
+  requireAuth,
   uploadProfilePhoto.single("photo"),
   async (req, res) => {
     const username = req.params.username;
+    if (!requireSameUser(req, res, username)) return;
 
-    if (!req.file) return res.status(400).send("Photo file is required");
+    if (!req.file) return res.status(400).json({ message: "Photo file is required" });
 
     const photoPath = `uploads/${req.file.filename}`;
 
@@ -601,22 +792,29 @@ app.post(
 
       const profile = await getUserProfile(username);
       res.json(profile);
-    } catch (error) {
-      res.status(500).send("Failed to upload profile photo");
+    } catch {
+      res.status(500).json({ message: "Failed to upload profile photo" });
     }
   }
 );
 
-app.post("/message", (req, res) => {
-  const { sender, receiver, message } = req.body;
+app.post("/message", requireAuth, async (req, res) => {
+  const { sender, receiver, message } = req.body || {};
 
-  db.query(
-    "INSERT INTO messages (sender,receiver,message,status) VALUES (?,?,?,'sent')",
-    [sender, receiver, message],
-    (err) => {
-      if (err) return res.status(500).send(err);
+  if (!sender || !receiver || !message || !String(message).trim()) {
+    return res.status(400).json({ message: "sender, receiver and message are required" });
+  }
 
-      const contactQuery = `
+  if (!requireSameUser(req, res, sender)) return;
+
+  try {
+    const insertResult = await runQuery(
+      "INSERT INTO messages (sender,receiver,message,status) VALUES (?,?,?,'sent')",
+      [sender, receiver, String(message).trim()]
+    );
+
+    await runQuery(
+      `
         INSERT INTO contacts (user1,user2)
         SELECT ?, ?
         WHERE NOT EXISTS (
@@ -624,112 +822,144 @@ app.post("/message", (req, res) => {
           WHERE (user1=? AND user2=?)
           OR (user1=? AND user2=?)
         )
-      `;
+      `,
+      [sender, receiver, sender, receiver, receiver, sender]
+    );
 
-      db.query(contactQuery, [sender, receiver, sender, receiver, receiver, sender]);
+    const messagePayload = {
+      id: insertResult.insertId,
+      sender,
+      receiver,
+      message: String(message).trim(),
+      status: "sent",
+      created_at: new Date(),
+    };
 
-      res.send("Saved");
-    }
-  );
+    emitToUser(receiver, "receiveMessage", messagePayload);
+    emitToUser(sender, "receiveMessage", messagePayload);
+
+    res.json({ message: "Saved", data: messagePayload });
+  } catch {
+    res.status(500).json({ message: "Failed to save message" });
+  }
 });
 
-app.get("/messages/:u1/:u2", (req, res) => {
+app.get("/messages/:u1/:u2", requireAuth, async (req, res) => {
   const { u1, u2 } = req.params;
+  if (!requireSameUser(req, res, u1)) return;
 
-  db.query(
-    `SELECT * FROM messages
-     WHERE (sender=? AND receiver=?)
-     OR (sender=? AND receiver=?)
-     ORDER BY created_at`,
-    [u1, u2, u2, u1],
-    (err, result) => {
-      if (err) return res.status(500).send(err);
-      res.json(result);
-    }
-  );
+  try {
+    const result = await runQuery(
+      `SELECT * FROM messages
+       WHERE (sender=? AND receiver=?)
+       OR (sender=? AND receiver=?)
+       ORDER BY created_at`,
+      [u1, u2, u2, u1]
+    );
+
+    res.json(result);
+  } catch {
+    res.status(500).json({ message: "Failed to load messages" });
+  }
 });
 
-app.get("/last-messages/:user", (req, res) => {
-  db.query(
-    `SELECT * FROM messages
-     WHERE sender=? OR receiver=?
-     ORDER BY created_at DESC`,
-    [req.params.user, req.params.user],
-    (err, result) => {
-      if (err) return res.status(500).send(err);
+app.get("/last-messages/:user", requireAuth, async (req, res) => {
+  const user = req.params.user;
+  if (!requireSameUser(req, res, user)) return;
 
-      const map = {};
+  try {
+    const result = await runQuery(
+      `SELECT * FROM messages
+       WHERE sender=? OR receiver=?
+       ORDER BY created_at DESC`,
+      [user, user]
+    );
 
-      result.forEach((msg) => {
-        const other = msg.sender === req.params.user ? msg.receiver : msg.sender;
-        if (!map[other]) map[other] = msg;
-      });
+    const map = {};
 
-      res.json(Object.values(map));
-    }
-  );
+    result.forEach((msg) => {
+      const other = msg.sender === user ? msg.receiver : msg.sender;
+      if (!map[other]) map[other] = msg;
+    });
+
+    res.json(Object.values(map));
+  } catch {
+    res.status(500).json({ message: "Failed to load last messages" });
+  }
 });
 
-app.get("/search/:username", (req, res) => {
+app.get("/search/:username", requireAuth, async (req, res) => {
   const search = `%${req.params.username}%`;
 
-  const query = `
-    SELECT
-      u.username,
-      p.profile_pic AS profilePic,
-      COALESCE(p.display_name, u.username) AS displayName,
-      COALESCE(p.about, 'Available') AS about
-    FROM users u
-    LEFT JOIN user_profiles p ON p.username = u.username
-    WHERE u.username LIKE ?
-    ORDER BY u.username ASC
-    LIMIT 20
-  `;
+  try {
+    const result = await runQuery(
+      `
+      SELECT
+        u.username,
+        p.profile_pic AS profilePic,
+        COALESCE(p.display_name, u.username) AS displayName,
+        COALESCE(p.about, 'Available') AS about
+      FROM users u
+      LEFT JOIN user_profiles p ON p.username = u.username
+      WHERE u.username LIKE ?
+      ORDER BY u.username ASC
+      LIMIT 20
+      `,
+      [search]
+    );
 
-  db.query(query, [search], (err, result) => {
-    if (err) return res.status(500).send(err);
     res.json(result);
-  });
+  } catch {
+    res.status(500).json({ message: "Failed to search users" });
+  }
 });
 
-app.get("/contacts/:username", (req, res) => {
+app.get("/contacts/:username", requireAuth, async (req, res) => {
   const username = req.params.username;
+  if (!requireSameUser(req, res, username)) return;
 
-  const query = `
-    SELECT
-      CASE
-        WHEN c.user1=? THEN c.user2
-        ELSE c.user1
-      END AS contact,
-      p.profile_pic AS profilePic,
-      COALESCE(p.display_name,
+  try {
+    const result = await runQuery(
+      `
+      SELECT
+        CASE
+          WHEN c.user1=? THEN c.user2
+          ELSE c.user1
+        END AS contact,
+        p.profile_pic AS profilePic,
+        COALESCE(p.display_name,
+          CASE WHEN c.user1=? THEN c.user2 ELSE c.user1 END
+        ) AS displayName,
+        COALESCE(p.about, 'Available') AS about
+      FROM contacts c
+      LEFT JOIN user_profiles p ON p.username =
         CASE WHEN c.user1=? THEN c.user2 ELSE c.user1 END
-      ) AS displayName,
-      COALESCE(p.about, 'Available') AS about
-    FROM contacts c
-    LEFT JOIN user_profiles p ON p.username =
-      CASE WHEN c.user1=? THEN c.user2 ELSE c.user1 END
-    WHERE c.user1=? OR c.user2=?
-  `;
+      WHERE c.user1=? OR c.user2=?
+      `,
+      [username, username, username, username, username]
+    );
 
-  db.query(query, [username, username, username, username, username], (err, result) => {
-    if (err) return res.status(500).send(err);
     res.json(result);
-  });
+  } catch {
+    res.status(500).json({ message: "Failed to load contacts" });
+  }
 });
 
-app.post("/upload", uploadChatFile.single("file"), (req, res) => {
-  if (!req.file) return res.status(400).send("File is required");
+app.post("/upload", requireAuth, uploadChatFile.single("file"), (req, res) => {
+  if (!req.file) return res.status(400).json({ message: "File is required" });
 
   res.json({
     file: req.file.filename,
   });
 });
 
-app.post("/statuses", uploadStatusMedia.single("media"), async (req, res) => {
-  const { username, text, privacy } = req.body;
+app.post("/statuses", requireAuth, uploadStatusMedia.single("media"), async (req, res) => {
+  const username = String(req.body?.username || "").trim();
+  const text = String(req.body?.text || "").trim();
+  const privacy = String(req.body?.privacy || "contacts");
 
-  if (!username) return res.status(400).send("Username is required");
+  if (!username) return res.status(400).json({ message: "Username is required" });
+  if (!requireSameUser(req, res, username)) return;
 
   const mediaUrl = req.file ? `uploads/${req.file.filename}` : null;
   const mediaType = req.file
@@ -739,7 +969,7 @@ app.post("/statuses", uploadStatusMedia.single("media"), async (req, res) => {
     : "text";
 
   if (!text && !mediaUrl) {
-    return res.status(400).send("Status text or media is required");
+    return res.status(400).json({ message: "Status text or media is required" });
   }
 
   const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
@@ -766,13 +996,14 @@ app.post("/statuses", uploadStatusMedia.single("media"), async (req, res) => {
     );
 
     res.json(statusRows[0]);
-  } catch (error) {
-    res.status(500).send("Failed to post status");
+  } catch {
+    res.status(500).json({ message: "Failed to post status" });
   }
 });
 
-app.get("/statuses/:username", async (req, res) => {
+app.get("/statuses/:username", requireAuth, async (req, res) => {
   const { username } = req.params;
+  if (!requireSameUser(req, res, username)) return;
 
   try {
     const rows = await runQuery(
@@ -797,13 +1028,14 @@ app.get("/statuses/:username", async (req, res) => {
     );
 
     res.json(rows);
-  } catch (error) {
-    res.status(500).send("Failed to load statuses");
+  } catch {
+    res.status(500).json({ message: "Failed to load statuses" });
   }
 });
 
-app.get("/statuses-feed/:username", async (req, res) => {
+app.get("/statuses-feed/:username", requireAuth, async (req, res) => {
   const username = req.params.username;
+  if (!requireSameUser(req, res, username)) return;
 
   try {
     const rows = await runQuery(
@@ -840,13 +1072,14 @@ app.get("/statuses-feed/:username", async (req, res) => {
     );
 
     res.json(rows);
-  } catch (error) {
-    res.status(500).send("Failed to load status feed");
+  } catch {
+    res.status(500).json({ message: "Failed to load status feed" });
   }
 });
 
-app.get("/calls/:username", async (req, res) => {
+app.get("/calls/:username", requireAuth, async (req, res) => {
   const username = req.params.username;
+  if (!requireSameUser(req, res, username)) return;
 
   try {
     const rows = await runQuery(
@@ -870,12 +1103,11 @@ app.get("/calls/:username", async (req, res) => {
     );
 
     res.json(rows);
-  } catch (error) {
-    res.status(500).send("Failed to load call history");
+  } catch {
+    res.status(500).json({ message: "Failed to load call history" });
   }
 });
 
-server.listen(5000, () => {
-  console.log("Server running");
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
-

@@ -1,21 +1,29 @@
 const mysql = require("mysql2");
 
-console.log("DB HOST:", process.env.DB_HOST); // debug
-
-const db = mysql.createConnection({
+const db = mysql.createPool({
   host: process.env.DB_HOST,
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
-  port: process.env.DB_PORT,
+  port: Number(process.env.DB_PORT || 3306),
+  waitForConnections: true,
+  connectionLimit: Number(process.env.DB_POOL_SIZE || 10),
+  queueLimit: 0,
+  connectTimeout: 10000,
+  ssl:
+    process.env.DB_SSL === "true"
+      ? { rejectUnauthorized: false }
+      : undefined,
 });
 
-db.connect((err) => {
+db.getConnection((err, connection) => {
   if (err) {
-    console.error("DB Error:", err);
+    console.error("DB Error:", err.message);
     return;
   }
-  console.log("MySQL Connected ✅");
+
+  console.log("MySQL Connected");
+  connection.release();
 });
 
 module.exports = db;
