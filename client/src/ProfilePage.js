@@ -1,14 +1,62 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 
-function ProfilePage({ user, profileData, onBack, onSave, onLogout }) {
+function ProfilePage({
+  user,
+  profileData,
+  onBack,
+  onSave,
+  onUploadPhoto,
+  onLogout,
+  apiBase,
+}) {
   const [form, setForm] = useState(profileData);
+  const [saving, setSaving] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState("");
 
   useEffect(() => {
     setForm(profileData);
   }, [profileData]);
 
+  const photoUrl = useMemo(() => {
+    if (!form.profilePic) return null;
+    return `${apiBase}/${form.profilePic}`;
+  }, [apiBase, form.profilePic]);
+
   const update = (key, value) => {
     setForm((prev) => ({ ...prev, [key]: value }));
+  };
+
+  const handleSave = async () => {
+    setSaving(true);
+    setError("");
+
+    try {
+      const saved = await onSave(form);
+      setForm(saved);
+    } catch {
+      setError("Could not save profile settings");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handlePhotoUpload = async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    setUploading(true);
+    setError("");
+
+    try {
+      const updated = await onUploadPhoto(file);
+      setForm(updated);
+    } catch {
+      setError("Could not upload profile photo");
+    } finally {
+      setUploading(false);
+      event.target.value = "";
+    }
   };
 
   return (
@@ -18,14 +66,36 @@ function ProfilePage({ user, profileData, onBack, onSave, onLogout }) {
           Back to Chat
         </button>
         <h2>Profile & Settings</h2>
-        <button className="send-btn" onClick={() => onSave(form)}>
-          Save
+        <button className="send-btn" onClick={handleSave} disabled={saving}>
+          {saving ? "Saving..." : "Save"}
         </button>
       </header>
+
+      {error && <p className="auth-error profile-error">{error}</p>}
 
       <section className="profile-grid">
         <article className="profile-card">
           <h3>Profile Details</h3>
+
+          <div className="profile-photo-block">
+            {photoUrl ? (
+              <img src={photoUrl} alt="Profile" className="profile-photo-preview" />
+            ) : (
+              <div className="profile-photo-fallback">
+                {(form.displayName || user.username).slice(0, 1).toUpperCase()}
+              </div>
+            )}
+
+            <label className="upload-btn">
+              {uploading ? "Uploading..." : "Upload Photo"}
+              <input
+                type="file"
+                accept="image/*"
+                disabled={uploading}
+                onChange={handlePhotoUpload}
+              />
+            </label>
+          </div>
 
           <label htmlFor="displayName">Display name</label>
           <input
@@ -117,3 +187,4 @@ function ProfilePage({ user, profileData, onBack, onSave, onLogout }) {
 }
 
 export default ProfilePage;
+

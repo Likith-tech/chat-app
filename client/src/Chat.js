@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import io from "socket.io-client";
 import axios from "axios";
 import ProfilePage from "./ProfilePage";
@@ -13,6 +13,10 @@ const TABS = [
   { id: "calls", label: "Calls" },
 ];
 
+const rtcConfig = {
+  iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+};
+
 const defaultProfile = {
   displayName: "",
   about: "Available",
@@ -22,6 +26,7 @@ const defaultProfile = {
   readReceipts: true,
   compactMode: false,
   statusPrivacy: "contacts",
+  profilePic: null,
 };
 
 function Chat({ user, onLogout, onUserUpdate }) {
@@ -40,30 +45,176 @@ function Chat({ user, onLogout, onUserUpdate }) {
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [showProfile, setShowProfile] = useState(false);
 
-  const [profileData, setProfileData] = useState(defaultProfile);
+  const [profileData, setProfileData] = useState({
+    ...defaultProfile,
+    ...user,
+    displayName: user.displayName || user.username,
+  });
+
+  const [statusText, setStatusText] = useState("");
+  const [statusFile, setStatusFile] = useState(null);
+  const [statusFeed, setStatusFeed] = useState([]);
+  const [statusLoading, setStatusLoading] = useState(false);
+  const [statusPosting, setStatusPosting] = useState(false);
+
+  const [callHistory, setCallHistory] = useState([]);
+  const [callsLoading, setCallsLoading] = useState(false);
+
+  const [incomingCall, setIncomingCall] = useState(null);
+  const [activeCall, setActiveCall] = useState(null);
+  const [callError, setCallError] = useState("");
+  const [localStream, setLocalStream] = useState(null);
+  const [remoteStream, setRemoteStream] = useState(null);
 
   const chatRef = useRef(null);
-  const profileStorageKey = useMemo(
-    () => `chat_profile_${user.username}`,
-    [user.username]
-  );
+  const peerConnectionRef = useRef(null);
+  const activeCallRef = useRef(null);
+  const callStartRef = useRef(null);
+
+  const localVideoRef = useRef(null);
+  const remoteVideoRef = useRef(null);
+
+  const avatarLabel = (name) => (name || "U").slice(0, 1).toUpperCase();
+
+  const avatarUrl = (path) => {
+    if (!path) return null;
+    return `${API_BASE}/${path}`;
+  };
+
+  const compactModeClass = profileData.compactMode ? "compact" : "";
 
   useEffect(() => {
-    const savedProfile = localStorage.getItem(profileStorageKey);
-    const parsed = savedProfile ? JSON.parse(savedProfile) : {};
-
-    setProfileData({
-      ...defaultProfile,
-      ...parsed,
-      displayName: parsed.displayName || user.username,
-    });
-  }, [profileStorageKey, user.username]);
+    activeCallRef.current = activeCall;
+  }, [activeCall]);
 
   useEffect(() => {
-    if (user) {
-      socket.emit("join", user);
+    if (localVideoRef.current) {
+      localVideoRef.current.srcObject = localStream || null;
     }
-  }, [user]);
+  }, [localStream]);
+
+  useEffect(() => {
+    if (remoteVideoRef.current) {
+      remoteVideoRef.current.srcObject = remoteStream || null;
+    }
+  }, [remoteStream]);
+
+  useEffect(() => {
+    const hydrateProfile = async () => {
+      try {
+        const res = await axios.get(`${API_BASE}/profile/${user.username}`);
+        const merged = {
+          ...defaultProfile,
+          ...res.data,
+          displayName: res.data.displayName || user.username,
+        };
+        setProfileData(merged);
+        onUserUpdate({ ...user, ...merged });
+      } catch {
+        setProfileData((prev) => ({
+          ...prev,
+          displayName: prev.displayName || user.username,
+        }));
+      }
+    };
+
+    hydrateProfile();
+  }, [onUserUpdate, user, user.username]);
+
+  useEffect(() => {
+    socket.emit("join", { username: user.username });
+  }, [user.username]);
+
+  const cleanupCall = useCallback((options = {}) => {
+    const { keepError = "" } = options;
+
+    if (peerConnectionRef.current) {
+      peerConnectionRef.current.ontrack = null;
+      peerConnectionRef.current.onicecandidate = null;
+      peerConnectionRef.current.close();
+      peerConnectionRef.current = null;
+    }
+
+    if (localStream) {
+      localStream.getTracks().forEach((track) => track.stop());
+    }
+
+    if (remoteStream) {
+      remoteStream.getTracks().forEach((track) => track.stop());
+    }
+
+    setLocalStream(null);
+    setRemoteStream(null);
+    setActiveCall(null);
+    setIncomingCall(null);
+    callStartRef.current = null;
+
+    if (keepError) {
+      setCallError(keepError);
+      setTimeout(() => setCallError(""), 3500);
+    }
+  }, [localStream, remoteStream]);
+
+  const ensureLocalMedia = useCallback(async (callType) => {
+    const wantsVideo = callType === "video";
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: true,
+      video: wantsVideo,
+    });
+
+    setLocalStream(stream);
+    return stream;
+  }, []);
+
+  const createPeerConnection = useCallback((peerUsername, roomId, mediaStream) => {
+    if (peerConnectionRef.current) {
+      peerConnectionRef.current.close();
+      peerConnectionRef.current = null;
+    }
+
+    const pc = new RTCPeerConnection(rtcConfig);
+
+    mediaStream.getTracks().forEach((track) => {
+      pc.addTrack(track, mediaStream);
+    });
+
+    pc.ontrack = (event) => {
+      const [stream] = event.streams;
+      if (stream) setRemoteStream(stream);
+    };
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        socket.emit("webrtc:ice-candidate", {
+          to: peerUsername,
+          from: user.username,
+          roomId,
+          candidate: event.candidate,
+        });
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
+        cleanupCall({ keepError: "Call disconnected" });
+      }
+    };
+
+    peerConnectionRef.current = pc;
+    return pc;
+  }, [cleanupCall, user.username]);
+
+  const loadCallHistory = useCallback(async () => {
+    setCallsLoading(true);
+    try {
+      const res = await axios.get(`${API_BASE}/calls/${user.username}`);
+      setCallHistory(res.data);
+    } catch {
+      setCallHistory([]);
+    } finally {
+      setCallsLoading(false);
+    }
+  }, [user.username]);
 
   useEffect(() => {
     const handleOnlineUsers = (users) => setOnlineUsers(users);
@@ -87,19 +238,105 @@ function Chat({ user, onLogout, onUserUpdate }) {
 
       setContacts((prev) => {
         const alreadyExists = prev.some((c) => c.contact === otherUser);
-        return alreadyExists ? prev : [...prev, { contact: otherUser }];
+        return alreadyExists ? prev : [...prev, { contact: otherUser, displayName: otherUser }];
       });
 
       if (!selectedUser) return;
 
       const isRelevant =
-        (data.sender === user.username &&
-          data.receiver === selectedUser.username) ||
-        (data.sender === selectedUser.username &&
-          data.receiver === user.username);
+        (data.sender === user.username && data.receiver === selectedUser.username) ||
+        (data.sender === selectedUser.username && data.receiver === user.username);
 
       if (isRelevant) {
         setMessages((prev) => [...prev, data]);
+      }
+    };
+
+    const handleIncomingCall = (payload) => {
+      setIncomingCall(payload);
+      setActiveTab("calls");
+    };
+
+    const handleCallAccepted = (payload) => {
+      if (activeCallRef.current?.roomId !== payload.roomId) return;
+
+      callStartRef.current = new Date();
+      setActiveCall((prev) =>
+        prev ? { ...prev, status: "connected", acceptedAt: new Date() } : prev
+      );
+      setCallError("");
+    };
+
+    const handleCallRejected = (payload) => {
+      if (activeCallRef.current?.roomId !== payload.roomId) return;
+      cleanupCall({ keepError: "Call declined" });
+      loadCallHistory();
+    };
+
+    const handleCallUnavailable = (payload) => {
+      if (activeCallRef.current?.roomId !== payload.roomId) return;
+      cleanupCall({ keepError: "User is offline" });
+      loadCallHistory();
+    };
+
+    const handleCallEnded = () => {
+      cleanupCall({ keepError: "Call ended" });
+      loadCallHistory();
+    };
+
+    const handleOffer = async ({ from, roomId, offer, callType }) => {
+      try {
+        const stream = localStream || (await ensureLocalMedia(callType || "voice"));
+        const pc = createPeerConnection(from, roomId, stream);
+
+        await pc.setRemoteDescription(new RTCSessionDescription(offer));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+
+        socket.emit("webrtc:answer", {
+          to: from,
+          from: user.username,
+          roomId,
+          answer,
+        });
+
+        callStartRef.current = new Date();
+        setActiveCall((prev) =>
+          prev
+            ? { ...prev, roomId, peerUsername: from, callType: callType || prev.callType, status: "connected" }
+            : {
+                roomId,
+                peerUsername: from,
+                callType: callType || "voice",
+                direction: "incoming",
+                status: "connected",
+              }
+        );
+      } catch {
+        setCallError("Failed to connect call");
+      }
+    };
+
+    const handleAnswer = async ({ roomId, answer }) => {
+      if (activeCallRef.current?.roomId !== roomId || !peerConnectionRef.current) return;
+
+      try {
+        await peerConnectionRef.current.setRemoteDescription(
+          new RTCSessionDescription(answer)
+        );
+      } catch {
+        setCallError("Call answer failed");
+      }
+    };
+
+    const handleIceCandidate = async ({ roomId, candidate }) => {
+      if (!candidate) return;
+      if (activeCallRef.current?.roomId !== roomId || !peerConnectionRef.current) return;
+
+      try {
+        await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch {
+        // ignore transient ICE candidate failures
       }
     };
 
@@ -108,13 +345,33 @@ function Chat({ user, onLogout, onUserUpdate }) {
     socket.on("stopTyping", handleStopTyping);
     socket.on("receiveMessage", handleReceiveMessage);
 
+    socket.on("call:incoming", handleIncomingCall);
+    socket.on("call:accepted", handleCallAccepted);
+    socket.on("call:rejected", handleCallRejected);
+    socket.on("call:unavailable", handleCallUnavailable);
+    socket.on("call:ended", handleCallEnded);
+
+    socket.on("webrtc:offer", handleOffer);
+    socket.on("webrtc:answer", handleAnswer);
+    socket.on("webrtc:ice-candidate", handleIceCandidate);
+
     return () => {
       socket.off("onlineUsers", handleOnlineUsers);
       socket.off("typing", handleTyping);
       socket.off("stopTyping", handleStopTyping);
       socket.off("receiveMessage", handleReceiveMessage);
+
+      socket.off("call:incoming", handleIncomingCall);
+      socket.off("call:accepted", handleCallAccepted);
+      socket.off("call:rejected", handleCallRejected);
+      socket.off("call:unavailable", handleCallUnavailable);
+      socket.off("call:ended", handleCallEnded);
+
+      socket.off("webrtc:offer", handleOffer);
+      socket.off("webrtc:answer", handleAnswer);
+      socket.off("webrtc:ice-candidate", handleIceCandidate);
     };
-  }, [selectedUser, user.username]);
+  }, [cleanupCall, createPeerConnection, ensureLocalMedia, loadCallHistory, selectedUser, user.username, localStream]);
 
   useEffect(() => {
     if (!selectedUser) {
@@ -122,15 +379,7 @@ function Chat({ user, onLogout, onUserUpdate }) {
       return;
     }
 
-<<<<<<< HEAD
-    axios
-      .get(
-        `https://chat-app-98qi.onrender.com/messages/${user.username}/${selectedUser.username}`
-      )
-      .then((res) => setMessages(res.data));
-=======
     setLoadingMessages(true);
->>>>>>> 170b423 (your message)
 
     axios
       .get(`${API_BASE}/messages/${user.username}/${selectedUser.username}`)
@@ -142,29 +391,9 @@ function Chat({ user, onLogout, onUserUpdate }) {
     axios.get(`${API_BASE}/last-messages/${user.username}`).then((res) => {
       const map = {};
 
-<<<<<<< HEAD
-    axios
-      .get(`https://chat-app-98qi.onrender.com/last-messages/${user.username}`)
-      .then((res) => {
-
-        const map = {};
-
-        res.data.forEach((msg) => {
-
-          const other =
-            msg.sender === user.username ? msg.receiver : msg.sender;
-
-          map[other] = msg.message;
-
-        });
-
-        setLastMessages(map);
-
-=======
       res.data.forEach((msg) => {
         const other = msg.sender === user.username ? msg.receiver : msg.sender;
         map[other] = msg.message;
->>>>>>> 170b423 (your message)
       });
 
       setLastMessages(map);
@@ -172,18 +401,7 @@ function Chat({ user, onLogout, onUserUpdate }) {
   }, [user.username]);
 
   useEffect(() => {
-<<<<<<< HEAD
-
-    if (search) {
-
-      axios
-        .get(`https://chat-app-98qi.onrender.com/search/${search}`)
-        .then((res) => setSearchResults(res.data));
-
-    } else {
-=======
     if (!search.trim()) {
->>>>>>> 170b423 (your message)
       setSearchResults([]);
       return;
     }
@@ -198,17 +416,9 @@ function Chat({ user, onLogout, onUserUpdate }) {
   }, [search]);
 
   useEffect(() => {
-<<<<<<< HEAD
-
-    axios
-      .get(`https://chat-app-98qi.onrender.com/contacts/${user.username}`)
-      .then((res) => setContacts(res.data));
-
-=======
     axios.get(`${API_BASE}/contacts/${user.username}`).then((res) => {
       setContacts(res.data);
     });
->>>>>>> 170b423 (your message)
   }, [user.username]);
 
   useEffect(() => {
@@ -216,6 +426,20 @@ function Chat({ user, onLogout, onUserUpdate }) {
       chatRef.current.scrollTop = chatRef.current.scrollHeight;
     }
   }, [messages]);
+
+  useEffect(() => {
+    if (activeTab === "status") {
+      setStatusLoading(true);
+      axios
+        .get(`${API_BASE}/statuses-feed/${user.username}`)
+        .then((res) => setStatusFeed(res.data))
+        .finally(() => setStatusLoading(false));
+    }
+
+    if (activeTab === "calls") {
+      loadCallHistory();
+    }
+  }, [activeTab, loadCallHistory, user.username]);
 
   const sendMessage = async () => {
     if (!message.trim() || !selectedUser) return;
@@ -227,12 +451,7 @@ function Chat({ user, onLogout, onUserUpdate }) {
     };
 
     socket.emit("sendMessage", msgData);
-<<<<<<< HEAD
-
-    await axios.post("https://chat-app-98qi.onrender.com/message", msgData);
-=======
     await axios.post(`${API_BASE}/message`, msgData);
->>>>>>> 170b423 (your message)
 
     setMessage("");
   };
@@ -245,14 +464,7 @@ function Chat({ user, onLogout, onUserUpdate }) {
     const formData = new FormData();
     formData.append("file", file);
 
-<<<<<<< HEAD
-    const res = await axios.post(
-      "https://chat-app-98qi.onrender.com/upload",
-      formData
-    );
-=======
     const res = await axios.post(`${API_BASE}/upload`, formData);
->>>>>>> 170b423 (your message)
 
     const fileUrl = `uploads/${res.data.file}`;
 
@@ -263,13 +475,7 @@ function Chat({ user, onLogout, onUserUpdate }) {
     };
 
     socket.emit("sendMessage", msgData);
-<<<<<<< HEAD
-
-    await axios.post("https://chat-app-98qi.onrender.com/message", msgData);
-
-=======
     await axios.post(`${API_BASE}/message`, msgData);
->>>>>>> 170b423 (your message)
   };
 
   const isOnline = (username) => {
@@ -285,22 +491,49 @@ function Chat({ user, onLogout, onUserUpdate }) {
     });
   };
 
-  const profileInitial = (profileData.displayName || user.username)
-    .slice(0, 1)
-    .toUpperCase();
+  const formatDateTime = (time) => {
+    if (!time) return "";
 
-  const handleProfileSave = (nextProfile) => {
-    setProfileData(nextProfile);
-    localStorage.setItem(profileStorageKey, JSON.stringify(nextProfile));
+    return new Date(time).toLocaleString([], {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  };
 
-    const nextUser = {
-      ...user,
+  const saveProfile = async (nextProfile) => {
+    const payload = {
       displayName: nextProfile.displayName || user.username,
       about: nextProfile.about,
+      phone: nextProfile.phone,
       accent: nextProfile.accent,
+      notifications: nextProfile.notifications,
+      readReceipts: nextProfile.readReceipts,
+      compactMode: nextProfile.compactMode,
+      statusPrivacy: nextProfile.statusPrivacy,
+      profilePic: profileData.profilePic,
     };
 
-    onUserUpdate(nextUser);
+    const res = await axios.put(`${API_BASE}/profile/${user.username}`, payload);
+    const merged = { ...defaultProfile, ...res.data };
+
+    setProfileData(merged);
+    onUserUpdate({ ...user, ...merged });
+    return merged;
+  };
+
+  const uploadProfilePhoto = async (file) => {
+    const formData = new FormData();
+    formData.append("photo", file);
+
+    const res = await axios.post(`${API_BASE}/profile/${user.username}/photo`, formData);
+    const merged = { ...defaultProfile, ...res.data };
+
+    setProfileData(merged);
+    onUserUpdate({ ...user, ...merged });
+
+    return merged;
   };
 
   const renderLastMessage = (rawText) => {
@@ -317,50 +550,267 @@ function Chat({ user, onLogout, onUserUpdate }) {
     return rawText;
   };
 
-  const renderChatArea = () => {
-    if (activeTab === "status") {
-      return (
-        <div className="placeholder-panel">
-          <h2>Status updates</h2>
-          <p>Create temporary updates and view recent status activity.</p>
-          <div className="placeholder-grid">
-            <div className="placeholder-card">
-              <h3>My Status</h3>
-              <p>Share text, images, or links for 24 hours.</p>
-            </div>
-            <div className="placeholder-card">
-              <h3>Recent Updates</h3>
-              <p>Your contacts' latest status updates will appear here.</p>
-            </div>
-          </div>
-        </div>
-      );
+  const postStatus = async () => {
+    if (!statusText.trim() && !statusFile) return;
+
+    setStatusPosting(true);
+
+    const formData = new FormData();
+    formData.append("username", user.username);
+    formData.append("text", statusText.trim());
+    formData.append("privacy", profileData.statusPrivacy);
+
+    if (statusFile) {
+      formData.append("media", statusFile);
     }
 
-    if (activeTab === "calls") {
-      return (
-        <div className="placeholder-panel">
-          <h2>Calls</h2>
-          <p>Track voice/video call history and start a new call quickly.</p>
-          <div className="placeholder-grid">
-            <div className="placeholder-card">
-              <h3>Recent Calls</h3>
-              <p>Missed and completed calls will be listed here.</p>
-            </div>
-            <div className="placeholder-card">
-              <h3>Start a Call</h3>
-              <p>Select a contact from chats and begin a call.</p>
-            </div>
-          </div>
-        </div>
-      );
+    try {
+      await axios.post(`${API_BASE}/statuses`, formData);
+      setStatusText("");
+      setStatusFile(null);
+
+      const feed = await axios.get(`${API_BASE}/statuses-feed/${user.username}`);
+      setStatusFeed(feed.data);
+    } finally {
+      setStatusPosting(false);
     }
+  };
+
+  const startOutgoingCall = async (callType) => {
+    if (!selectedUser) return;
+
+    try {
+      setCallError("");
+      const roomId = `${user.username}-${selectedUser.username}-${Date.now()}`;
+
+      const stream = await ensureLocalMedia(callType);
+      const pc = createPeerConnection(selectedUser.username, roomId, stream);
+
+      setActiveCall({
+        roomId,
+        peerUsername: selectedUser.username,
+        callType,
+        direction: "outgoing",
+        status: "calling",
+      });
+
+      socket.emit("call:initiate", {
+        from: user.username,
+        to: selectedUser.username,
+        roomId,
+        callType,
+      });
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      socket.emit("webrtc:offer", {
+        to: selectedUser.username,
+        from: user.username,
+        roomId,
+        callType,
+        offer,
+      });
+    } catch {
+      cleanupCall({ keepError: "Microphone/Camera access denied" });
+    }
+  };
+
+  const acceptIncomingCall = async () => {
+    if (!incomingCall) return;
+
+    try {
+      const stream = await ensureLocalMedia(incomingCall.callType || "voice");
+      createPeerConnection(incomingCall.from, incomingCall.roomId, stream);
+
+      setActiveCall({
+        roomId: incomingCall.roomId,
+        peerUsername: incomingCall.from,
+        callType: incomingCall.callType || "voice",
+        direction: "incoming",
+        status: "connecting",
+      });
+
+      socket.emit("call:accept", {
+        from: user.username,
+        to: incomingCall.from,
+        roomId: incomingCall.roomId,
+        callType: incomingCall.callType || "voice",
+      });
+
+      setIncomingCall(null);
+    } catch {
+      setCallError("Unable to access device for call");
+    }
+  };
+
+  const rejectIncomingCall = () => {
+    if (!incomingCall) return;
+
+    socket.emit("call:reject", {
+      from: user.username,
+      to: incomingCall.from,
+      roomId: incomingCall.roomId,
+      callType: incomingCall.callType || "voice",
+    });
+
+    setIncomingCall(null);
+  };
+
+  const endCurrentCall = () => {
+    if (!activeCallRef.current) return;
+
+    const now = Date.now();
+    const started = callStartRef.current ? callStartRef.current.getTime() : now;
+    const durationSec = Math.max(0, Math.floor((now - started) / 1000));
+
+    socket.emit("call:end", {
+      from: user.username,
+      to: activeCallRef.current.peerUsername,
+      roomId: activeCallRef.current.roomId,
+      callType: activeCallRef.current.callType,
+      durationSec,
+      status: "completed",
+    });
+
+    cleanupCall();
+    loadCallHistory();
+  };
+
+  const groupedStatusFeed = useMemo(() => {
+    const groups = new Map();
+
+    statusFeed.forEach((status) => {
+      if (!groups.has(status.username)) {
+        groups.set(status.username, {
+          username: status.username,
+          displayName: status.displayName || status.username,
+          profilePic: status.profilePic,
+          items: [],
+        });
+      }
+
+      groups.get(status.username).items.push(status);
+    });
+
+    return Array.from(groups.values());
+  }, [statusFeed]);
+
+  const renderCallBadge = (entry) => {
+    if (entry.callType === "video") return "Video";
+    return "Voice";
+  };
+
+  const renderStatusPanel = () => (
+    <div className="status-panel">
+      <div className="status-composer">
+        <h2>Status</h2>
+        <textarea
+          value={statusText}
+          onChange={(e) => setStatusText(e.target.value)}
+          placeholder="Share an update"
+          rows={3}
+        />
+
+        <div className="status-actions-row">
+          <label className="upload-btn">
+            Add media
+            <input type="file" onChange={(e) => setStatusFile(e.target.files?.[0] || null)} />
+          </label>
+
+          <button className="send-btn" onClick={postStatus} disabled={statusPosting}>
+            {statusPosting ? "Posting..." : "Post status"}
+          </button>
+        </div>
+
+        {statusFile && <p className="info-line">Selected: {statusFile.name}</p>}
+      </div>
+
+      <div className="status-feed">
+        <h3>Recent updates</h3>
+        {statusLoading && <p className="info-line">Loading statuses...</p>}
+
+        {!statusLoading && groupedStatusFeed.length === 0 && (
+          <p className="info-line">No statuses yet.</p>
+        )}
+
+        {groupedStatusFeed.map((group) => (
+          <article key={group.username} className="status-group">
+            <div className="status-user">
+              {group.profilePic ? (
+                <img src={avatarUrl(group.profilePic)} alt={group.displayName} className="status-avatar" />
+              ) : (
+                <div className="avatar small">{avatarLabel(group.displayName)}</div>
+              )}
+              <strong>{group.displayName}</strong>
+            </div>
+
+            <div className="status-items">
+              {group.items.map((item) => (
+                <div key={item.id} className="status-item">
+                  {item.text && <p>{item.text}</p>}
+                  {item.mediaUrl && (
+                    /\.(jpg|jpeg|png|gif|webp)$/i.test(item.mediaUrl) ? (
+                      <img src={avatarUrl(item.mediaUrl)} alt="status" className="status-image" />
+                    ) : (
+                      <a href={avatarUrl(item.mediaUrl)} target="_blank" rel="noreferrer">
+                        View attachment
+                      </a>
+                    )
+                  )}
+                  <span>{formatDateTime(item.createdAt)}</span>
+                </div>
+              ))}
+            </div>
+          </article>
+        ))}
+      </div>
+    </div>
+  );
+
+  const renderCallsPanel = () => (
+    <div className="calls-panel">
+      <h2>Calls</h2>
+      <p className="info-line">Start a voice/video call from an active chat.</p>
+
+      {callsLoading && <p className="info-line">Loading call history...</p>}
+
+      {!callsLoading && callHistory.length === 0 && (
+        <p className="info-line">No call history yet.</p>
+      )}
+
+      {!callsLoading &&
+        callHistory.map((entry) => {
+          const isCaller = entry.caller === user.username;
+          const withUser = isCaller ? entry.receiver : entry.caller;
+
+          return (
+            <div key={entry.id} className="call-row">
+              <div>
+                <strong>{withUser}</strong>
+                <p>
+                  {renderCallBadge(entry)} • {entry.status}
+                </p>
+              </div>
+              <div className="call-meta">
+                <span>{formatDateTime(entry.startedAt)}</span>
+                <span>{entry.durationSec || 0}s</span>
+              </div>
+            </div>
+          );
+        })}
+    </div>
+  );
+
+  const renderChatArea = () => {
+    if (activeTab === "status") return renderStatusPanel();
+    if (activeTab === "calls") return renderCallsPanel();
 
     return (
       <>
         <header className="chat-header">
           <div>
-            <h2>{selectedUser?.username || "Select a chat"}</h2>
+            <h2>{selectedUser?.displayName || selectedUser?.username || "Select a chat"}</h2>
             <p>
               {selectedUser
                 ? isOnline(selectedUser.username)
@@ -369,9 +819,26 @@ function Chat({ user, onLogout, onUserUpdate }) {
                 : "Choose a contact or search users"}
             </p>
           </div>
-          <button className="ghost-btn" onClick={() => setShowProfile(true)}>
-            Profile
-          </button>
+
+          <div className="chat-header-actions">
+            <button
+              className="ghost-btn"
+              onClick={() => startOutgoingCall("voice")}
+              disabled={!selectedUser}
+            >
+              Voice Call
+            </button>
+            <button
+              className="ghost-btn"
+              onClick={() => startOutgoingCall("video")}
+              disabled={!selectedUser}
+            >
+              Video Call
+            </button>
+            <button className="ghost-btn" onClick={() => setShowProfile(true)}>
+              Profile
+            </button>
+          </div>
         </header>
 
         <section className="messages" ref={chatRef}>
@@ -391,30 +858,9 @@ function Chat({ user, onLogout, onUserUpdate }) {
                 <div className="msg-bubble">
                   {msg.message.includes("uploads/") ? (
                     /\.(jpg|jpeg|png|gif|webp)$/i.test(msg.message) ? (
-                      <img
-<<<<<<< HEAD
-                        src={`https://chat-app-98qi.onrender.com/${msg.message}`}
-                        style={{
-                          width: "150px",
-                          borderRadius: "10px",
-                        }}
-                        alt="img"
-=======
-                        src={`${API_BASE}/${msg.message}`}
-                        alt="attachment"
-                        className="msg-image"
->>>>>>> 170b423 (your message)
-                      />
+                      <img src={avatarUrl(msg.message)} alt="attachment" className="msg-image" />
                     ) : (
-                      <a
-<<<<<<< HEAD
-                        href={`https://chat-app-98qi.onrender.com/${msg.message}`}
-=======
-                        href={`${API_BASE}/${msg.message}`}
->>>>>>> 170b423 (your message)
-                        target="_blank"
-                        rel="noreferrer"
-                      >
+                      <a href={avatarUrl(msg.message)} target="_blank" rel="noreferrer">
                         Download file
                       </a>
                     )
@@ -443,9 +889,7 @@ function Chat({ user, onLogout, onUserUpdate }) {
             onKeyDown={(e) => {
               if (e.key === "Enter") sendMessage();
             }}
-            placeholder={
-              selectedUser ? "Type a message" : "Select a chat to send messages"
-            }
+            placeholder={selectedUser ? "Type a message" : "Select a chat to send messages"}
             disabled={!selectedUser}
           />
 
@@ -468,17 +912,26 @@ function Chat({ user, onLogout, onUserUpdate }) {
         user={user}
         profileData={profileData}
         onBack={() => setShowProfile(false)}
-        onSave={handleProfileSave}
+        onSave={saveProfile}
+        onUploadPhoto={uploadProfilePhoto}
         onLogout={onLogout}
+        apiBase={API_BASE}
       />
     );
   }
 
   return (
-    <div className="chat-app" style={{ "--accent-color": profileData.accent }}>
+    <div
+      className={`chat-app ${compactModeClass}`}
+      style={{ "--accent-color": profileData.accent }}
+    >
       <aside className="sidebar">
         <div className="brand">
-          <div className="avatar">{profileInitial}</div>
+          {profileData.profilePic ? (
+            <img src={avatarUrl(profileData.profilePic)} alt="profile" className="avatar-image" />
+          ) : (
+            <div className="avatar">{avatarLabel(profileData.displayName || user.username)}</div>
+          )}
           <div>
             <h1>{profileData.displayName || user.username}</h1>
             <p>{profileData.about || "Available"}</p>
@@ -520,7 +973,7 @@ function Chat({ user, onLogout, onUserUpdate }) {
                   setActiveTab("chats");
                 }}
               >
-                <strong>{entry.username}</strong>
+                <strong>{entry.displayName || entry.username}</strong>
                 <span>{isOnline(entry.username) ? "Online" : "Offline"}</span>
               </button>
             ))}
@@ -540,11 +993,11 @@ function Chat({ user, onLogout, onUserUpdate }) {
                 key={`${username}-${index}`}
                 className={`list-item ${active ? "active" : ""}`}
                 onClick={() => {
-                  setSelectedUser({ username });
+                  setSelectedUser(entry);
                   setActiveTab("chats");
                 }}
               >
-                <strong>{username}</strong>
+                <strong>{entry.displayName || username}</strong>
                 <span className="meta-line">
                   <i className={isOnline(username) ? "dot online" : "dot"} />
                   {renderLastMessage(lastMessages[username])}
@@ -565,8 +1018,54 @@ function Chat({ user, onLogout, onUserUpdate }) {
       </aside>
 
       <main className="chat-main">{renderChatArea()}</main>
+
+      {incomingCall && !activeCall && (
+        <div className="call-popup">
+          <p>
+            Incoming {incomingCall.callType} call from <strong>{incomingCall.from}</strong>
+          </p>
+          <div className="call-popup-actions">
+            <button className="send-btn" onClick={acceptIncomingCall}>
+              Accept
+            </button>
+            <button className="danger-btn" onClick={rejectIncomingCall}>
+              Decline
+            </button>
+          </div>
+        </div>
+      )}
+
+      {activeCall && (
+        <div className="active-call-overlay">
+          <div className="active-call-card">
+            <h3>
+              {activeCall.callType === "video" ? "Video" : "Voice"} call with {activeCall.peerUsername}
+            </h3>
+            <p>Status: {activeCall.status}</p>
+
+            {activeCall.callType === "video" ? (
+              <div className="video-grid">
+                <video ref={localVideoRef} autoPlay muted playsInline className="video-tile" />
+                <video ref={remoteVideoRef} autoPlay playsInline className="video-tile" />
+              </div>
+            ) : (
+              <div className="voice-placeholder">Voice call in progress...</div>
+            )}
+
+            <button className="danger-btn" onClick={endCurrentCall}>
+              End Call
+            </button>
+          </div>
+        </div>
+      )}
+
+      {callError && <div className="call-error">{callError}</div>}
     </div>
   );
 }
 
 export default Chat;
+
+
+
+
