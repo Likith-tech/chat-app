@@ -1,12 +1,22 @@
 import React, { useState } from "react";
 import axios from "axios";
 
-function Register({ switchToLogin }) {
+function Register({ switchToLogin, setUser }) {
   const [username, setUsername] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
 
   const handleRegister = async () => {
+    if (!username.trim() || !email.trim() || !password.trim()) {
+      setError("Username, email and password are required.");
+      return;
+    }
+
+    setLoading(true);
+    setError("");
+
     try {
       await axios.post("https://chat-app-98qi.onrender.com/register", {
         username,
@@ -14,26 +24,66 @@ function Register({ switchToLogin }) {
         password,
       });
 
-      alert("Registered successfully!");
-      switchToLogin();
+      const loginRes = await axios.post(
+        "https://chat-app-98qi.onrender.com/login",
+        {
+          email,
+          password,
+        }
+      );
+
+      if (loginRes.data.token) {
+        localStorage.setItem("token", loginRes.data.token);
+      }
+
+      sessionStorage.setItem("user", JSON.stringify(loginRes.data.user));
+      setUser(loginRes.data.user);
     } catch (err) {
-      alert("Registration failed");
+      setError(err?.response?.data || "Registration failed. Try again.");
+    } finally {
+      setLoading(false);
     }
   };
 
   return (
-    <div>
-      <h2>Register</h2>
-
-      <input placeholder="Username" onChange={(e) => setUsername(e.target.value)} />
-      <input placeholder="Email" onChange={(e) => setEmail(e.target.value)} />
+    <div className="auth-form">
+      <label htmlFor="register-username">Username</label>
       <input
+        id="register-username"
+        placeholder="Choose username"
+        value={username}
+        onChange={(e) => setUsername(e.target.value)}
+      />
+
+      <label htmlFor="register-email">Email</label>
+      <input
+        id="register-email"
+        placeholder="you@example.com"
+        value={email}
+        onChange={(e) => setEmail(e.target.value)}
+      />
+
+      <label htmlFor="register-password">Password</label>
+      <input
+        id="register-password"
         type="password"
         placeholder="Password"
+        value={password}
         onChange={(e) => setPassword(e.target.value)}
       />
 
-      <button onClick={handleRegister}>Register</button>
+      {error && <p className="auth-error">{error}</p>}
+
+      <button onClick={handleRegister} disabled={loading}>
+        {loading ? "Creating account..." : "Register"}
+      </button>
+
+      <p className="auth-switch">
+        Already have an account?{" "}
+        <button type="button" className="auth-link" onClick={switchToLogin}>
+          Login
+        </button>
+      </p>
     </div>
   );
 }

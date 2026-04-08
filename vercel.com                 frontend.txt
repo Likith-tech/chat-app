@@ -1,0 +1,3 @@
+vercel.com                 frontend
+dashboard.render.com       backebd
+railway.com                database
